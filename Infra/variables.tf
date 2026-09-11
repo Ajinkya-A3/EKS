@@ -67,19 +67,23 @@ variable "addons" {
   default = [
     {
       name    = "vpc-cni"
-      version = "v1.21.1-eksbuild.1"
+      version = "v1.22.4-eksbuild.3"
     },
     {
       name    = "coredns"
-      version = "v1.13.2-eksbuild.3"
+      version = "v1.14.3-eksbuild.14"
     },
     {
       name    = "kube-proxy"
-      version = "v1.35.0-eksbuild.2"
+      version = "v1.36.0-eksbuild.17"
     },
     {
       name    = "aws-ebs-csi-driver"
-      version = "v1.57.1-eksbuild.1"
+      version = "v1.65.0-eksbuild.2"
+    },
+    {
+      name    = "metrics-server"
+      version = "v0.9.0-eksbuild.10"
     }
   ]
 }
