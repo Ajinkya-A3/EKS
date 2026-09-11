@@ -16,7 +16,7 @@ variable "cluster_version" {
 
 
 variable "instance_type" {
-  default = "t3.medium"
+  default = "m6g.large"
 }
 
 variable "ami_type" {
