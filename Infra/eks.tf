@@ -111,6 +111,9 @@ resource "aws_eks_node_group" "ondemand-node" {
   capacity_type = "ON_DEMAND"
   ami_type      = var.ami_type
 
+  version              = var.cluster_version  # ties node AMI to control plane version
+  force_update_version = true                 # forces rolling update when version changes
+
   scaling_config {
     desired_size = var.desired_size
     max_size     = var.max_size
