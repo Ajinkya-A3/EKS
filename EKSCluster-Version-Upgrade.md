@@ -1,7 +1,9 @@
 # EKS Cluster Version Upgrade Runbook
 
-> **Scope:** Covers Terraform-managed EKS clusters with managed node groups, EKS addons, and Karpenter node pools.  
-> **Rule:** Always upgrade **one minor version at a time** — 1.29 → 1.30 → 1.31. Never skip.
+> **Scope:** Covers Terraform-managed EKS clusters with managed node groups, EKS addons, and Karpenter node pools.
+> **Rule:** Always upgrade **one minor version at a time** — 1.34 → 1.35 → 1.36. Never skip.
+>
+> **Version status as of last update (Sep 11, 2026):** Upstream Kubernetes **1.37** GA'd on Aug 26, 2026, but **Amazon EKS does not yet support 1.37**. The newest EKS-supported version at this time is **1.36**. Do not plan a Terraform `cluster_version` bump to `1.37` until AWS publishes an official "Amazon EKS now supports Kubernetes 1.37" announcement and `aws eks describe-addon-versions --kubernetes-version 1.37` returns results in your region. Check before every upgrade cycle — this window closes without much notice.
 
 ---
 
@@ -16,6 +18,7 @@
 7. [Workload Interruption Prevention](#7-workload-interruption-prevention)
 8. [Rollback Plan](#8-rollback-plan)
 9. [Quick Reference — Version Commands](#9-quick-reference--version-commands)
+10. [Terraform Gotchas Learned the Hard Way](#10-terraform-gotchas-learned-the-hard-way)
 
 ---
 
@@ -26,6 +29,12 @@ Complete every item before touching any Terraform or kubectl command.
 ### 1.1 Check Current Versions
 
 ```bash
+# Confirm target version is actually supported by EKS BEFORE editing any Terraform
+aws eks describe-addon-versions \
+  --query 'addons[0].addonVersions[0].compatibilities[*].clusterVersion' \
+  --output table
+# If your target version isn't in this list, EKS doesn't support it yet — stop here.
+
 # Current control plane version
 aws eks describe-cluster \
   --name <cluster-name> \
@@ -54,63 +63,47 @@ aws eks describe-addon \
 
 ```bash
 # METHOD 1 — AWS CLI (recommended, most accurate)
-# Lists all addon versions compatible with your TARGET Kubernetes version
 aws eks describe-addon-versions \
-  --kubernetes-version 1.32 \
+  --kubernetes-version 1.36 \
   --query 'addons[*].{Addon:addonName, DefaultVersion:addonVersions[?compatibilities[?defaultVersion==`true`]].addonVersion | [0]}' \
   --output table
 
 # For a specific addon
 aws eks describe-addon-versions \
-  --kubernetes-version 1.32 \
+  --kubernetes-version 1.36 \
   --addon-name coredns \
   --query 'addons[0].addonVersions[*].addonVersion' \
   --output table
 
 # METHOD 2 — eksctl (human-friendly output)
 eksctl utils describe-addon-versions \
-  --kubernetes-version 1.32 \
+  --kubernetes-version 1.36 \
   --name coredns
 
-# All addons at once via eksctl
 eksctl utils describe-addon-versions \
-  --kubernetes-version 1.32
+  --kubernetes-version 1.36
 ```
 
 ### 1.3 Check Karpenter Compatibility
 
 ```bash
-# Check current Karpenter version installed
 helm list -n kube-system | grep karpenter
-
-# Check what Karpenter version supports your target K8s version
-# https://karpenter.sh/docs/upgrading/compatibility/
-# Always verify against the official compatibility matrix
+# Then verify against: https://karpenter.sh/docs/upgrading/compatibility/
 ```
 
 ### 1.4 Verify Workload Health
 
 ```bash
-# All pods should be Running or Completed — fix any CrashLoopBackOff before upgrading
 kubectl get pods --all-namespaces | grep -v "Running\|Completed"
-
-# Check PodDisruptionBudgets — understand what's protected
 kubectl get pdb --all-namespaces
-
-# Check Deployments for replica count — single replica workloads will have downtime
 kubectl get deployments --all-namespaces | awk '$3 == 1 {print}'
-
-# Ensure no nodes are already in NotReady state
 kubectl get nodes | grep -v Ready
 ```
 
 ### 1.5 Backup
 
 ```bash
-# Backup all cluster manifests (optional but recommended)
 kubectl get all --all-namespaces -o yaml > cluster-backup-$(date +%F).yaml
-
-# Update your kubeconfig
 aws eks update-kubeconfig --name <cluster-name> --region <region>
 ```
 
@@ -120,42 +113,38 @@ aws eks update-kubeconfig --name <cluster-name> --region <region>
 
 ### 2.1 Update the Variable
 
-In your `terraform.tfvars` (or wherever `cluster_version` is set):
-
 ```hcl
-# Before
-cluster_version = "1.31"
-
-# After
-cluster_version = "1.32"
+# variables.tf — type the version explicitly as a string, never a bare number
+variable "cluster_version" {
+  type    = string
+  default = "1.36"   # was "1.35"
+}
 ```
+
+> ⚠️ Declaring `default = 1.36` without `type = string` lets HCL treat it as a number — a value like `1.30` can silently normalize to `1.3` and break your apply downstream. Always quote it and declare `type = string`.
 
 ### 2.2 Plan and Apply — Control Plane Only
 
 ```bash
-# Always plan first to confirm ONLY the cluster resource changes
 terraform plan -target=aws_eks_cluster.eks
-
-# Apply ONLY the control plane — do not apply everything at once
 terraform apply -target=aws_eks_cluster.eks
 ```
 
-> ⏱ **EKS control plane upgrades take 10–20 minutes.** The API server will be briefly unavailable (~30 seconds) during the transition. `kubectl` commands may fail during this window — this is normal.
+> ⏱ **EKS control plane upgrades take 10–20 minutes.** The API server is briefly unavailable (~30 seconds) during the transition. `kubectl` may fail during this window — this is normal.
 
 ### 2.3 Verify Control Plane
 
 ```bash
-# Confirm the control plane is on the new version
 aws eks describe-cluster \
   --name <cluster-name> \
   --query "cluster.{Version:version, Status:status}" \
   --output table
-
 # Should show: ACTIVE + new version
-kubectl version --short
+
+kubectl version
 ```
 
-> ⚠️ At this point your nodes are still on the OLD version — this is fine. EKS supports nodes one minor version behind the control plane. **Do not skip to addons — upgrade nodes next.**
+> ⚠️ Nodes are still on the OLD version at this point — that's fine, EKS tolerates one minor version of skew. **Do not skip to addons — upgrade nodes next.**
 
 ---
 
@@ -163,7 +152,7 @@ kubectl version --short
 
 ### 3.1 Confirm Node Group Config Has These Fields
 
-Your `aws_eks_node_group` resource must have:
+This is the single most common gap that causes a false "No changes" on `terraform plan`. If `version` and `force_update_version` are missing from your `aws_eks_node_group` resource, Terraform has nothing tying the node group to `var.cluster_version` — bumping the cluster version alone will NOT touch the node group.
 
 ```hcl
 resource "aws_eks_node_group" "ondemand-node" {
@@ -187,19 +176,14 @@ resource "aws_eks_node_group" "ondemand-node" {
 ### 3.2 Apply Node Group Upgrade
 
 ```bash
-# Plan to confirm what changes (should show AMI version update)
 terraform plan -target=aws_eks_node_group.ondemand-node
-
-# Apply the rolling node update
 terraform apply -target=aws_eks_node_group.ondemand-node
 ```
 
 ### 3.3 What Happens During Node Group Upgrade
 
-AWS managed node groups handle this **automatically** in order:
-
 ```
-1. New node launched with updated AMI (kubelet 1.32)
+1. New node launched with updated AMI (kubelet 1.36)
 2. Old node cordoned  → no new pods scheduled on it
 3. Old node drained   → pods evicted gracefully (respects PDBs)
 4. Old node terminated
@@ -211,13 +195,9 @@ AWS managed node groups handle this **automatically** in order:
 ### 3.4 Monitor the Rolling Update
 
 ```bash
-# Watch nodes transition (run in a separate terminal)
 watch -n 5 kubectl get nodes
-
-# Watch pods reschedule during drain
 watch -n 5 kubectl get pods --all-namespaces
 
-# Check node group update status
 aws eks describe-nodegroup \
   --cluster-name <cluster-name> \
   --nodegroup-name <nodegroup-name> \
@@ -229,10 +209,7 @@ aws eks describe-nodegroup \
 ### 3.5 Verify Node Group
 
 ```bash
-# All nodes should now show the new version
 kubectl get nodes -o wide
-
-# Confirm kubelet version matches control plane
 kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.nodeInfo.kubeletVersion}{"\n"}{end}'
 ```
 
@@ -245,9 +222,8 @@ kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.n
 ### 4.1 Find the Right Addon Versions for Target K8s Version
 
 ```bash
-# Get the DEFAULT (recommended) version per addon for target version
 aws eks describe-addon-versions \
-  --kubernetes-version 1.32 \
+  --kubernetes-version 1.36 \
   --query 'addons[*].{
     Name: addonName,
     Default: addonVersions[?compatibilities[?defaultVersion==`true`]].addonVersion | [0],
@@ -255,56 +231,32 @@ aws eks describe-addon-versions \
   }' \
   --output table
 
-# Get ALL available versions for a specific addon
 aws eks describe-addon-versions \
-  --kubernetes-version 1.32 \
+  --kubernetes-version 1.36 \
   --addon-name kube-proxy \
   --query 'addons[0].addonVersions[*].{Version:addonVersion,Default:compatibilities[0].defaultVersion}' \
   --output table
 
-# Using eksctl for friendlier output
-eksctl utils describe-addon-versions \
-  --kubernetes-version 1.32 \
-  --name kube-proxy
-
-eksctl utils describe-addon-versions \
-  --kubernetes-version 1.32 \
-  --name coredns
-
-eksctl utils describe-addon-versions \
-  --kubernetes-version 1.32 \
-  --name vpc-cni
-
-eksctl utils describe-addon-versions \
-  --kubernetes-version 1.32 \
-  --name aws-ebs-csi-driver
+eksctl utils describe-addon-versions --kubernetes-version 1.36 --name kube-proxy
+eksctl utils describe-addon-versions --kubernetes-version 1.36 --name coredns
+eksctl utils describe-addon-versions --kubernetes-version 1.36 --name vpc-cni
+eksctl utils describe-addon-versions --kubernetes-version 1.36 --name aws-ebs-csi-driver
+eksctl utils describe-addon-versions --kubernetes-version 1.36 --name metrics-server
 ```
 
 ### 4.2 Update Addon Versions in Terraform
 
-Update your `addons` variable with versions found above:
-
 ```hcl
-# In terraform.tfvars or variables.tf
 addons = [
-  {
-    name    = "coredns"
-    version = "v1.11.4-eksbuild.2"   # ← replace with output from step 4.1
-  },
-  {
-    name    = "kube-proxy"
-    version = "v1.32.3-eksbuild.2"   # ← replace with output from step 4.1
-  },
-  {
-    name    = "vpc-cni"
-    version = "v1.19.3-eksbuild.1"   # ← replace with output from step 4.1
-  },
-  {
-    name    = "aws-ebs-csi-driver"
-    version = "v1.40.0-eksbuild.1"   # ← replace with output from step 4.1
-  }
+  { name = "vpc-cni",             version = "v1.22.4-eksbuild.3"  },
+  { name = "coredns",             version = "v1.14.3-eksbuild.14" },
+  { name = "kube-proxy",          version = "v1.36.0-eksbuild.17" },
+  { name = "aws-ebs-csi-driver",  version = "v1.65.0-eksbuild.2"  },
+  { name = "metrics-server",      version = "v0.9.0-eksbuild.10"  },
 ]
 ```
+
+> Before adding a new addon like `metrics-server`, check it isn't already running via Helm elsewhere in the cluster (`helm list -n kube-system | grep metrics-server`) to avoid a conflicting duplicate install.
 
 ### 4.3 Apply Addon Upgrades
 
@@ -316,16 +268,13 @@ terraform apply -target=aws_eks_addon.eks-addons
 ### 4.4 Verify Addons
 
 ```bash
-# All addons should show ACTIVE status
 aws eks list-addons --cluster-name <cluster-name> --output table
 
-# Verify each addon is healthy
 aws eks describe-addon \
   --cluster-name <cluster-name> \
   --addon-name coredns \
   --query "addon.{Status:status,Version:addonVersion}"
 
-# Verify addon pods are running
 kubectl get pods -n kube-system
 ```
 
@@ -333,47 +282,65 @@ kubectl get pods -n kube-system
 
 ## 5. Step 4 — Upgrade Karpenter Node Pools
 
-### 5.1 Understand What Happens to Karpenter Nodes
+### 5.1 Two Very Different Behaviors Depending on Your `EC2NodeClass` AMI Configuration
 
-Karpenter nodes are **not automatically upgraded** when you upgrade EKS. They continue running their old kubelet version until:
+This is the part most teams get wrong, so read carefully before assuming Karpenter "does nothing" until you tell it to.
 
-- They naturally expire (per `expireAfter` in your NodePool), **or**
-- You force a replacement via an `EC2NodeClass` annotation change
+**Case A — Pinned AMI ID**
 
-```
-Control Plane      → 1.32  ✅ (Terraform)
-Managed Node Group → 1.32  ✅ (Terraform, rolling)
-Karpenter nodes    → 1.31  ⚠️  still on old kubelet — YOU must handle
+```yaml
+amiSelectorTerms:
+  - id: ami-0123456789abcdef0
 ```
 
-### 5.2 Is It Safe to Let Karpenter Nodes Expire Naturally?
+Karpenter has no signal that anything changed when the control plane is upgraded. Nodes on this NodeClass will **not** move to the new Kubernetes version until:
+- They naturally expire (per `expireAfter`), **or**
+- You manually force replacement via an annotation bump (Section 5.4 below)
+
+```
+Control Plane      → 1.36  ✅ (Terraform)
+Managed Node Group → 1.36  ✅ (Terraform, rolling)
+Karpenter nodes    → 1.35  ⚠️  still on old kubelet — YOU must handle
+```
+
+**Case B — `@latest` AMI alias (the common case)**
+
+```yaml
+amiSelectorTerms:
+  - alias: al2023@latest
+```
+
+Karpenter continuously resolves `@latest` against the **cluster's current Kubernetes version**, discovered dynamically via the EKS API. The moment the control plane finishes upgrading to 1.36, `@latest` starts resolving to a 1.36-built AMI. Karpenter's drift detection then sees existing nodes are running a now-stale AMI, marks them `drifted`, and **automatically** replaces them — no annotation bump needed:
+
+```
+1. Karpenter detects control plane version changed
+2. @latest alias now resolves to new AMI
+3. Existing nodes marked "drifted" (AMI mismatch)
+4. Launches replacement node first (new AMI/kubelet)
+5. Waits for replacement to be Ready
+6. Cordons + drains old node (respects PDBs)
+7. Terminates old node
+8. Repeats across all NodePools using this NodeClass
+```
+
+This happens on its own timeline (usually within minutes of the control plane going `ACTIVE`) — you'll see it in `kubectl get nodeclaim` and `kubectl get nodes` without having applied anything to the `EC2NodeClass`. **This is expected and safe**, not a bug — treat unplanned drift-triggered rotations right after a control plane upgrade as confirmation the alias worked, and verify workload health same as any other rolling replacement (Section 5.5, Section 6).
+
+### 5.2 Is It Safe to Let Karpenter Nodes Expire Naturally? (Pinned-AMI case only)
 
 | NodePool | expireAfter | Safe to Let Expire? | Reason |
 |---|---|---|---|
 | spot-arm64 | 168h (7 days) | ✅ Usually fine | Replaced within a week |
 | spot-amd64 | 168h (7 days) | ✅ Usually fine | Replaced within a week |
-| ondemand-arm64 | 720h (30 days) | ⚠️ Risky | 30 days is too long if you upgrade frequently |
-| ondemand-amd64 | 720h (30 days) | ⚠️ Risky | Same — and these run critical workloads |
+| ondemand-arm64 | 720h (30 days) | ⚠️ Risky | Too long if you upgrade frequently |
+| ondemand-amd64 | 720h (30 days) | ⚠️ Risky | Same — critical workloads |
 
-**The key risk:** If you do another K8s upgrade (e.g., 1.32 → 1.33) before the 30-day nodes expire from the 1.31 → 1.32 upgrade, those nodes would be **two minor versions behind** — which is outside the supported compatibility window.
+**Key risk:** another K8s upgrade before 30-day nodes expire leaves them two minor versions behind — outside the supported skew window.
 
-**Recommendation:**
-- Spot pools (7 days): Let expire naturally — low risk
-- OnDemand pools (30 days): Force replace — too long to leave uncontrolled
+### 5.3 Option A — Let Expire Naturally (Spot Pools, Pinned-AMI Case)
 
-### 5.3 Option A — Let Expire Naturally (Spot Pools Only)
+No action required. Same replace-then-drain sequence as Section 5.1 Case B, just triggered by `expireAfter` instead of drift.
 
-No action required. Karpenter will:
-1. Detect the node has exceeded `expireAfter`
-2. Launch a replacement node (picks up new AMI automatically via `al2023@latest`)
-3. Cordon + drain the old node gracefully
-4. Terminate the old node
-
-Your workloads are live-migrated to the new node during this process.
-
-### 5.4 Option B — Force Replace via EC2NodeClass Annotation (Recommended for OnDemand)
-
-Add or increment an annotation in your `EC2NodeClass` Terraform resource:
+### 5.4 Option B — Force Replace via EC2NodeClass Annotation (Pinned-AMI Case, Recommended for OnDemand)
 
 ```hcl
 resource "kubectl_manifest" "karpenter_ec2_node_class_default" {
@@ -383,8 +350,6 @@ resource "kubectl_manifest" "karpenter_ec2_node_class_default" {
     metadata:
       name: default
       annotations:
-        # Increment this on every EKS version upgrade to trigger
-        # Karpenter to replace ALL nodes from this NodeClass
         upgrade-revision: "2"        # ← was "1", now bump to "2"
     spec:
       # ... rest of config unchanged ...
@@ -393,53 +358,29 @@ resource "kubectl_manifest" "karpenter_ec2_node_class_default" {
 ```
 
 ```bash
-# Apply the annotation change
 terraform apply -target=kubectl_manifest.karpenter_ec2_node_class_default
 ```
 
-**What Karpenter does when it detects the annotation change:**
-
-```
-1. Marks all nodes from this NodeClass as "drifted"
-2. For each drifted node:
-   a. Launches a replacement node first (new AMI, new kubelet)
-   b. Waits for replacement node to be Ready
-   c. Cordons the old node
-   d. Drains pods gracefully (respects PDBs and terminationGracePeriodSeconds)
-   e. Terminates the old node
-3. Repeats across all NodePools using this NodeClass
-```
-
-> Karpenter respects your PodDisruptionBudgets during this process. Pods with PDBs will not be evicted if it would violate the budget.
+> If you're on the `@latest` alias, you generally don't need this step — drift detection already handled it per Section 5.1 Case B. Only bump this annotation if you need to force a replacement for a reason unrelated to AMI drift (e.g., a config change to the NodeClass itself).
 
 ### 5.5 Monitor Karpenter Node Replacement
 
 ```bash
-# Watch Karpenter logs for drift/replacement events
 kubectl logs -n kube-system -l app.kubernetes.io/name=karpenter --follow
-
-# Watch nodes being replaced in real time
 watch -n 5 kubectl get nodes -L karpenter.sh/nodepool,kubernetes.io/arch
+kubectl get nodeclaim
 
-# Check which nodes are drifted
 kubectl get nodes -o json | jq '.items[] | select(.metadata.annotations["karpenter.sh/disruption-reason"] != null) | {name: .metadata.name, reason: .metadata.annotations["karpenter.sh/disruption-reason"]}'
 
-# Watch pods rescheduling
 watch -n 5 kubectl get pods --all-namespaces --field-selector=status.phase!=Running
 ```
 
 ### 5.6 Upgrade Karpenter Itself (Helm)
 
-Karpenter has its own compatibility matrix with Kubernetes versions. After upgrading the control plane, upgrade Karpenter:
-
 ```bash
-# Check current Karpenter version
 helm list -n kube-system | grep karpenter
-
 # Check compatibility: https://karpenter.sh/docs/upgrading/compatibility/
-# Then update the version in your Helm release Terraform resource
 
-# Example if managing via Helm CLI
 helm upgrade karpenter oci://public.ecr.aws/karpenter/karpenter \
   --version 1.3.3 \           # ← version compatible with your new K8s version
   --namespace kube-system \
@@ -450,34 +391,21 @@ helm upgrade karpenter oci://public.ecr.aws/karpenter/karpenter \
 
 ## 6. Step 5 — Post-Upgrade Validation
 
-Run these after all four steps are complete.
-
 ```bash
-# 1. All nodes on correct version
 kubectl get nodes -o wide
-
-# 2. All pods healthy
 kubectl get pods --all-namespaces | grep -v "Running\|Completed\|Succeeded"
-
-# 3. Control plane version matches nodes
 kubectl version
-
-# 4. Addons all ACTIVE
 aws eks list-addons --cluster-name <cluster-name> --output table
 
-# 5. CoreDNS resolving correctly
 kubectl run dns-test --image=busybox:1.28 --restart=Never --rm -it \
   -- nslookup kubernetes.default
 
-# 6. EBS volumes still working (if using EBS CSI)
 kubectl get storageclass
 kubectl get pv
 
-# 7. Karpenter nodes on new version
 kubectl get nodes -L karpenter.sh/nodepool \
   -o custom-columns='NAME:.metadata.name,VERSION:.status.nodeInfo.kubeletVersion,POOL:.metadata.labels.karpenter\.sh/nodepool'
 
-# 8. No PDB violations
 kubectl get pdb --all-namespaces
 ```
 
@@ -485,11 +413,7 @@ kubectl get pdb --all-namespaces
 
 ## 7. Workload Interruption Prevention
 
-Follow these practices to ensure zero (or minimal) workload disruption during upgrades.
-
 ### 7.1 PodDisruptionBudgets — Most Important
-
-Every production Deployment should have a PDB. Without one, the node drain process can evict all pods simultaneously.
 
 ```yaml
 apiVersion: policy/v1
@@ -498,16 +422,13 @@ metadata:
   name: my-app-pdb
   namespace: my-app
 spec:
-  minAvailable: 1          # at least 1 pod must stay running during drain
-  # OR
-  # maxUnavailable: 1      # at most 1 pod can be down at once
+  minAvailable: 1
   selector:
     matchLabels:
       app: my-app
 ```
 
 ```bash
-# Check which Deployments have NO PDB (these are at risk)
 kubectl get deployments --all-namespaces -o json | \
   jq -r '.items[] | select(.spec.replicas > 0) | "\(.metadata.namespace)/\(.metadata.name)"' | \
   while read dep; do
@@ -520,10 +441,7 @@ kubectl get deployments --all-namespaces -o json | \
 
 ### 7.2 Multiple Replicas
 
-Single-replica Deployments will have downtime during node drain regardless of PDBs.
-
 ```bash
-# Find single-replica Deployments in non-system namespaces
 kubectl get deployments --all-namespaces \
   -o custom-columns='NAMESPACE:.metadata.namespace,NAME:.metadata.name,REPLICAS:.spec.replicas' | \
   awk '$3 == 1 && $1 != "kube-system"'
@@ -532,8 +450,6 @@ kubectl get deployments --all-namespaces \
 Scale to at least 2 replicas before upgrading any production workload's node.
 
 ### 7.3 Pod Anti-Affinity
-
-Ensure replicas spread across nodes so a single node drain doesn't take down all replicas:
 
 ```yaml
 spec:
@@ -550,22 +466,18 @@ spec:
 
 ### 7.4 Proper Termination Handling
 
-Ensure your app handles SIGTERM gracefully and completes in-flight requests:
-
 ```yaml
 spec:
-  terminationGracePeriodSeconds: 60   # give app 60s to finish requests
+  terminationGracePeriodSeconds: 60
   containers:
     - name: my-app
       lifecycle:
         preStop:
           exec:
-            command: ["/bin/sh", "-c", "sleep 5"]  # delay to let LB drain
+            command: ["/bin/sh", "-c", "sleep 5"]
 ```
 
 ### 7.5 Resource Requests and Limits
-
-Nodes can only be drained if pods can be rescheduled elsewhere. Pods without resource requests may fail to schedule on new nodes during high utilization:
 
 ```yaml
 resources:
@@ -589,10 +501,10 @@ EKS control plane **cannot be downgraded**. Prevention is the only option.
 | Node group stuck draining | Check if a pod is blocking drain: `kubectl describe node <node>` |
 | Pod refusing to evict | Check PDB: `kubectl get pdb -A`; temporarily reduce `minAvailable` if safe |
 | Addon update fails | Revert addon version in Terraform and reapply |
-| Karpenter nodes misbehaving | Revert `upgrade-revision` annotation; nodes will stop being replaced |
+| Karpenter nodes misbehaving (pinned AMI) | Revert `upgrade-revision` annotation; nodes stop being replaced |
+| Karpenter nodes misbehaving (`@latest` alias) | Drift is tied to control plane version, not reversible by annotation — pin the AMI explicitly if you need to halt replacement |
 
 ```bash
-# If a node is stuck draining, find what's blocking it
 kubectl describe node <node-name> | grep -A 20 "Non-terminated Pods"
 
 # Force-drain as last resort (will violate PDBs — use with caution)
@@ -606,97 +518,64 @@ kubectl drain <node-name> --ignore-daemonsets --delete-emptydir-data --force
 ```bash
 # ── DISCOVERY ────────────────────────────────────────────────────────────────
 
-# What K8s versions does EKS support right now?
 aws eks describe-addon-versions \
   --query 'addons[0].addonVersions[0].compatibilities[*].clusterVersion' \
   --output table
 
-# What addon versions are available for K8s 1.32?
 aws eks describe-addon-versions \
-  --kubernetes-version 1.32 \
+  --kubernetes-version 1.36 \
   --query 'addons[*].{Addon:addonName,Latest:addonVersions[0].addonVersion,Default:addonVersions[?compatibilities[?defaultVersion==`true`]].addonVersion|[0]}' \
   --output table
 
-# What AMI release version to use for node group?
 aws ssm get-parameter \
-  --name /aws/service/eks/optimized-ami/1.32/amazon-linux-2023/x86_64/standard/recommended/release_version \
+  --name /aws/service/eks/optimized-ami/1.36/amazon-linux-2023/x86_64/standard/recommended/release_version \
   --query Parameter.Value --output text
 
-# ARM64 AMI
 aws ssm get-parameter \
-  --name /aws/service/eks/optimized-ami/1.32/amazon-linux-2023/arm64/standard/recommended/release_version \
+  --name /aws/service/eks/optimized-ami/1.36/amazon-linux-2023/arm64/standard/recommended/release_version \
   --query Parameter.Value --output text
 
 # ── STATUS ───────────────────────────────────────────────────────────────────
 
-# Cluster version
 aws eks describe-cluster --name <cluster> --query cluster.version --output text
 
-# Node versions
 kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.nodeInfo.kubeletVersion}{"\n"}{end}'
 
-# Addon versions
 aws eks list-addons --cluster-name <cluster> | \
   jq -r '.addons[]' | \
   xargs -I{} aws eks describe-addon --cluster-name <cluster> --addon-name {} \
   --query "addon.{Name:addonName,Version:addonVersion,Status:status}" \
   --output table
 
-# Karpenter node pool nodes
 kubectl get nodes -L karpenter.sh/nodepool,karpenter.sh/capacity-type,kubernetes.io/arch
+kubectl get nodeclaim
 
 # ── APPLY ORDER ──────────────────────────────────────────────────────────────
 
-# 1. Control plane
 terraform apply -target=aws_eks_cluster.eks
-
-# 2. Managed node group
 terraform apply -target=aws_eks_node_group.ondemand-node
-
-# 3. Addons
 terraform apply -target=aws_eks_addon.eks-addons
-
-# 4. Karpenter EC2NodeClass (triggers Karpenter node replacement)
-terraform apply -target=kubectl_manifest.karpenter_ec2_node_class_default
-
-# 5. Final drift check
-terraform apply
+terraform apply -target=kubectl_manifest.karpenter_ec2_node_class_default   # only if pinned-AMI
+terraform apply   # final drift check across everything
 ```
 
 ---
 
-## Upgrade Order Summary
+## 10. Terraform Gotchas Learned the Hard Way
 
-```
-┌─────────────────────────────────────────────────────────┐
-│                  EKS UPGRADE SEQUENCE                   │
-├─────────────────────────────────────────────────────────┤
-│  PRE-CHECK                                              │
-│    1 All pods healthy                                   │
-│    2 PDBs in place for critical workloads               │
-│    3 Target addon versions noted                        │
-│    4 Karpenter compatibility verified                   │
-├─────────────────────────────────────────────────────────┤
-│  STEP 1 — Control Plane          (~15 min)              │
-│    terraform apply -target=aws_eks_cluster.eks          │
-├─────────────────────────────────────────────────────────┤
-│  STEP 2 — Managed Node Group     (~5–10 min/node)       │
-│    terraform apply -target=aws_eks_node_group.*         │
-│    [AWS auto-cordons, drains, replaces each node]       │
-├─────────────────────────────────────────────────────────┤
-│  STEP 3 — EKS Addons             (~5 min)               │
-│    terraform apply -target=aws_eks_addon.*              │
-├─────────────────────────────────────────────────────────┤
-│  STEP 4 — Karpenter              (~varies)              │
-│    4a. Upgrade Karpenter Helm release                   │
-│    4b. Bump upgrade-revision annotation in EC2NodeClass │
-│    4c. Spot nodes: let expire (7 days) OR force replace │
-│    4d. OnDemand nodes: force replace (recommended)      │
-├─────────────────────────────────────────────────────────┤
-│  POST-VALIDATE                                          │
-│    1 All nodes on new version                           │
-│    2 All pods Running                                   │
-│    3 Addons ACTIVE                                      │
-│    4 DNS resolving                                      │
-└─────────────────────────────────────────────────────────┘
-```
+These are real failure modes worth checking before you assume Terraform is "stuck":
+
+1. **`terraform plan -target=aws_eks_cluster.eks` shows "No changes" even after editing `cluster_version`.**
+   Check for an override winning over your edit: `terraform.tfvars`, `*.auto.tfvars`, a `TF_VAR_cluster_version` env var, or `-var-file` in your usual apply command. Precedence is `-var`/`-var-file` > `*.auto.tfvars` > `terraform.tfvars` > variable `default`.
+
+2. **`terraform state show aws_eks_cluster.eks` errors with "No instance found."**
+   You're in the wrong Terraform root/directory. Run `find . -name "*.tf" | xargs grep -l "aws_eks_cluster"` from the repo root to locate the directory actually wired to your live cluster's state, and `cd` there before continuing.
+
+3. **Node group plan shows "No changes" even though the control plane already moved versions.**
+   Your `aws_eks_node_group` resource is missing `version = var.cluster_version` and `force_update_version = true`. Without these, nothing ties the node group to the cluster version variable — add them (Section 3.1) and replan.
+
+4. **Numeric `cluster_version` default silently truncates.**
+   `default = 1.30` can become `1.3` under HCL's number type. Always declare `type = string` and quote the value.
+
+5. **Karpenter nodes rotate even though you never touched the `EC2NodeClass`.**
+   Expected if you're using an `@latest` AMI alias — see Section 5.1 Case B. Not a bug.
