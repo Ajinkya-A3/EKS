@@ -109,6 +109,7 @@ resource "aws_eks_node_group" "ondemand-node" {
   node_role_arn = aws_iam_role.node.arn
   subnet_ids    = aws_subnet.private[*].id  # ← private subnets only
   capacity_type = "ON_DEMAND"
+  ami_type      = var.ami_type
 
   scaling_config {
     desired_size = var.desired_size
@@ -126,9 +127,9 @@ resource "aws_eks_node_group" "ondemand-node" {
   }
 
   labels = {
-    "type" = "ondemand"
-    "role"      = "system"          # ← clear role label
-    "node-type" = "managed"         # ← distinguishes from Karpenter nodes
+    "type"      = "ondemand"
+    "role"      = "system"  # ← clear role label
+    "node-type" = "managed" # ← distinguishes from Karpenter nodes
   }
 
   tags = merge(var.tags, {

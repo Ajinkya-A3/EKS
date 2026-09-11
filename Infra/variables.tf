@@ -19,6 +19,37 @@ variable "instance_type" {
   default = "t3.medium"
 }
 
+variable "ami_type" {
+  description = "EKS node AMI type — must match the architecture of instance_type (arm64 AMI for m6g/m7g/t4g instances, x86_64 AMI for m5/m6i/t3 instances)."
+  type        = string
+  default     = "AL2023_ARM_64_STANDARD"
+
+  validation {
+    condition = contains([
+      "AL2023_x86_64_STANDARD",
+      "AL2023_ARM_64_STANDARD",
+      "AL2023_x86_64_NEURON",
+      "AL2023_x86_64_NVIDIA",
+      "AL2023_ARM_64_NVIDIA",
+      "AL2_x86_64",
+      "AL2_x86_64_GPU",
+      "AL2_ARM_64",
+      "BOTTLEROCKET_ARM_64",
+      "BOTTLEROCKET_x86_64",
+      "BOTTLEROCKET_ARM_64_FIPS",
+      "BOTTLEROCKET_x86_64_FIPS",
+      "BOTTLEROCKET_ARM_64_NVIDIA",
+      "BOTTLEROCKET_x86_64_NVIDIA",
+      "WINDOWS_CORE_2019_x86_64",
+      "WINDOWS_FULL_2019_x86_64",
+      "WINDOWS_CORE_2022_x86_64",
+      "WINDOWS_FULL_2022_x86_64",
+      "CUSTOM"
+    ], var.ami_type)
+    error_message = "ami_type must be one of the values accepted by the EKS CreateNodegroup API — e.g. AL2023_ARM_64_STANDARD, AL2023_x86_64_STANDARD, BOTTLEROCKET_ARM_64, BOTTLEROCKET_x86_64. See AWS EKS Nodegroup API reference."
+  }
+}
+
 variable "desired_size" {
   default = 2
 }
